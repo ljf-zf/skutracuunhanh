@@ -63,7 +63,7 @@ function renderOrders(data) {
         <span class="carrier ${carrierUnknown ? "unknown" : ""}">${escapeHtml(order.carrier || "Chưa xác định")}</span>
       </div>
       ${order.trackingCode ? `<div class="tracking-code">Mã vận đơn: ${escapeHtml(order.trackingCode)}</div>` : ""}
-      <div class="section-label">SẢN PHẨM · SỐ LƯỢNG</div>
+      <div class="section-label"></div>
       ${items}
     </article>`;
   }).join("");
