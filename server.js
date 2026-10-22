@@ -49,51 +49,6 @@ function orderCodeCandidates(o) {
     o.order_number, o.orderNumber, o.name, o.tracking_code
   ].filter(v => v !== undefined && v !== null && String(v).trim() !== "").map(String);
 }
-function normalizeSearchText(value) {
-  return String(value ?? "")
-    .normalize("NFD").replace(/[\u0300-\u036f]/g, "")
-    .replace(/đ/g, "d").replace(/Đ/g, "D")
-    .toLocaleLowerCase("vi-VN").replace(/\s+/g, " ").trim();
-}
-function getRecipientAddress(o) {
-  const candidates = [
-    o.shipping_address, o.shippingAddress, o.receiver_address, o.receiverAddress,
-    o.delivery_address, o.deliveryAddress, o.address_shipping, o.shipping_address_text,
-    o.customer_address, o.customerAddress, o.address,
-    o.shipping && (o.shipping.address || o.shipping.shipping_address || o.shipping.receiver_address),
-    o.shipping_info && (o.shipping_info.address || o.shipping_info.full_address || o.shipping_info.receiver_address),
-    o.shipping_package && (o.shipping_package.address || o.shipping_package.shipping_address),
-    o.receiver && (o.receiver.address || o.receiver.full_address),
-    // Sapo Market Place response example: customer.address + district + city.
-    // Combine these fields so searching the visible suffix after a masked street
-    // prefix still works even when the API stores district/city separately.
-    o.customer && [
-      o.customer.shipping_address,
-      o.customer.address,
-      o.customer.ward,
-      o.customer.district,
-      o.customer.city,
-      o.customer.country
-    ].filter(v => typeof v === "string" && v.trim()).join(", ")
-  ];
-  function flattenAddress(value) {
-    if (typeof value === "string") return value.trim();
-    if (!value || typeof value !== "object") return "";
-    const parts = [
-      value.full_address, value.fullAddress, value.address,
-      value.address1, value.address2, value.street, value.street_address,
-      value.ward_name, value.ward, value.district_name, value.district,
-      value.city_name, value.province_name, value.province, value.city,
-      value.receiver_address, value.receiverAddress
-    ].filter(v => typeof v === "string" && v.trim());
-    return [...new Set(parts.map(v => v.trim()))].join(", ");
-  }
-  for (const candidate of candidates) {
-    const address = flattenAddress(candidate);
-    if (address) return address;
-  }
-  return "";
-}
 function getOrderDate(o) {
   const raw = o.created_at || o.createdAt || o.order_created_at || o.updated_at || o.updatedAt || "";
   const t = Date.parse(raw);
@@ -155,7 +110,6 @@ function mapOrder(o) {
     id: String(o.id || o.order_id || fullCode),
     code: fullCode,
     trackingCode: String(o.tracking_code || o.tracking_number || ""),
-    address: getRecipientAddress(o),
     createdAt: o.created_at || o.createdAt || o.order_created_at || "",
     createdTs: getOrderDate(o),
     carrier: getCarrier(o),
@@ -173,7 +127,7 @@ async function fetchOrdersPage(config, page) {
     connectionIds: process.env.SAPO_CONNECTION_IDS,
     sortBy: process.env.SAPO_SORT_BY || "ISSUED_AT",
     orderBy: process.env.SAPO_ORDER_BY || "desc",
-    channelOrderStatus: process.env.SAPO_CHANNEL_ORDER_STATUS || "READY_TO_SHIP,RETRY_SHIP"
+    channelOrderStatus: process.env.SAPO_CHANNEL_ORDER_STATUS || "PROCESSED,READY_TO_SHIP,RETRY_SHIP"
   };
   for (const [key, value] of Object.entries(params)) if (value) url.searchParams.set(key, value);
   url.searchParams.set("page", String(page));
@@ -192,42 +146,161 @@ async function fetchOrdersPage(config, page) {
     clearTimeout(timeout);
   }
 }
-app.get("/api/search", async (req, res) => {
-  const query = String(req.query.q || req.query.last4 || "").normalize("NFC").trim().toLocaleLowerCase("vi-VN");
-  if (query.length < 2) return res.status(400).json({ error: "Nhập ít nhất 2 ký tự của mã đơn, mã vận đơn hoặc địa chỉ nhận hàng." });
-  if (query.length > 100) return res.status(400).json({ error: "Từ khóa quá dài." });
+function normalizeLastCodePart(value) {
+  return String(value ?? "").normalize("NFD").replace(/[\u0300-\u036f]/g, "")
+    .toLocaleLowerCase("vi-VN").replace(/[^a-z0-9]/g, "");
+}
+
+async function searchOrders(query) {
   const cacheKey = query;
   const cached = cache.get(cacheKey);
-  if (cached && cached.expires > Date.now()) return res.json({ ...cached.data, cached: true });
+  if (cached && cached.expires > Date.now()) return { ...cached.data, cached: true };
+
+  const config = getSapoConfig();
+  const first = await fetchOrdersPage(config, 1);
+  let all = [...first.orders];
+  const totalPages = Math.min(MAX_PAGES, Math.ceil(Math.max(first.total, all.length) / 100));
+  for (let page = 2; page <= totalPages; page++) {
+    const result = await fetchOrdersPage(config, page);
+    if (!result.orders.length) break;
+    all.push(...result.orders);
+    if (all.length >= first.total && first.total > 0) break;
+  }
+
+  const normalizedQuery = normalizeLastCodePart(query);
+  const matches = all.map(mapOrder).filter(o => {
+    const candidates = [o.code, o.trackingCode].filter(Boolean);
+    return candidates.some(code => normalizeLastCodePart(code).includes(normalizedQuery));
+  }).sort((a, b) => b.createdTs - a.createdTs);
+
+  const data = {
+    query,
+    count: matches.length,
+    orders: matches,
+    scanned: all.length,
+    partial: totalPages >= MAX_PAGES && all.length < first.total,
+    checkedAt: new Date().toISOString()
+  };
+  cache.set(cacheKey, { expires: Date.now() + CACHE_MS, data });
+  return data;
+}
+
+app.get("/api/health/config", (_req, res) => {
+  res.json({
+    ok: true,
+    sapoAuthorizationConfigured: Boolean(process.env.SAPO_AUTHORIZATION),
+    sapoMarketTokenConfigured: Boolean(process.env.SAPO_MARKET_TOKEN),
+    telegramBotConfigured: Boolean(process.env.TELEGRAM_BOT_TOKEN),
+    telegramWebhookSecretConfigured: Boolean(process.env.TELEGRAM_WEBHOOK_SECRET),
+    telegramAllowedUsersConfigured: Boolean(String(process.env.TELEGRAM_ALLOWED_USER_IDS || "").trim()),
+    statusFilter: process.env.SAPO_CHANNEL_ORDER_STATUS || "PROCESSED,READY_TO_SHIP,RETRY_SHIP"
+  });
+});
+
+app.get("/api/search", async (req, res) => {
+  const query = String(req.query.q || req.query.last4 || "").normalize("NFC").trim().toLocaleLowerCase("vi-VN");
+  if (query.length < 2) return res.status(400).json({ error: "Nhập ít nhất 2 ký tự của mã đơn hoặc mã vận đơn." });
+  if (query.length > 100) return res.status(400).json({ error: "Từ khóa quá dài." });
   try {
-    const config = getSapoConfig();
-    const first = await fetchOrdersPage(config, 1);
-    let all = [...first.orders];
-    const totalPages = Math.min(MAX_PAGES, Math.ceil(Math.max(first.total, all.length) / 100));
-    for (let page = 2; page <= totalPages; page++) {
-      const result = await fetchOrdersPage(config, page);
-      if (!result.orders.length) break;
-      all.push(...result.orders);
-      if (all.length >= first.total && first.total > 0) break;
-    }
-    const normalizedQuery = normalizeSearchText(query);
-    const matches = all.map(mapOrder).filter(o => {
-      const candidates = [o.code, o.trackingCode, o.address].filter(Boolean);
-      return candidates.some(value => normalizeSearchText(value).includes(normalizedQuery));
-    }).sort((a, b) => b.createdTs - a.createdTs);
-    const data = {
-      query,
-      count: matches.length,
-      orders: matches,
-      scanned: all.length,
-      partial: totalPages >= MAX_PAGES && all.length < first.total,
-      checkedAt: new Date().toISOString()
-    };
-    cache.set(cacheKey, { expires: Date.now() + CACHE_MS, data });
-    res.json(data);
+    res.json(await searchOrders(query));
   } catch (error) {
     const message = error && error.message ? error.message : "Không thể kết nối Sapo.";
     res.status(502).json({ error: message });
+  }
+});
+
+function telegramAllowed(userId) {
+  const allowed = String(process.env.TELEGRAM_ALLOWED_USER_IDS || "")
+    .split(",").map(v => v.trim()).filter(Boolean);
+  return allowed.length > 0 && allowed.includes(String(userId));
+}
+
+function cleanTelegramText(value) {
+  return String(value ?? "").replace(/\s+/g, " ").trim();
+}
+
+async function telegramSend(chatId, text) {
+  const token = String(process.env.TELEGRAM_BOT_TOKEN || "").trim();
+  if (!token) throw new Error("Chưa cấu hình TELEGRAM_BOT_TOKEN trên Render.");
+  const response = await fetch(`https://api.telegram.org/bot${token}/sendMessage`, {
+    method: "POST",
+    headers: { "content-type": "application/json" },
+    body: JSON.stringify({ chat_id: chatId, text, disable_web_page_preview: true })
+  });
+  if (!response.ok) throw new Error(`Telegram sendMessage lỗi HTTP ${response.status}.`);
+}
+
+function telegramOrderText(order) {
+  const lines = [
+    `Đơn: ${cleanTelegramText(order.code || "Không rõ mã")}`,
+    `Trạng thái: ${cleanTelegramText(order.status || "Chưa xác định")}`,
+    `Vận chuyển: ${cleanTelegramText(order.carrier || "Chưa xác định")}`
+  ];
+  if (order.trackingCode) lines.push(`Vận đơn: ${cleanTelegramText(order.trackingCode)}`);
+  for (const item of (order.items || [])) {
+    lines.push(`SKU: ${cleanTelegramText(item.sku || "Chưa có SKU")} × ${Number(item.quantity) || 0}`);
+    lines.push(`SP: ${cleanTelegramText(item.name || "Chưa có tên")}${item.variant ? ` · ${cleanTelegramText(item.variant)}` : ""}`);
+  }
+  return lines.join("\n");
+}
+
+app.post("/telegram/webhook", async (req, res) => {
+  const secret = String(process.env.TELEGRAM_WEBHOOK_SECRET || "").trim();
+  if (!secret || req.get("X-Telegram-Bot-Api-Secret-Token") !== secret) {
+    return res.status(401).json({ error: "Unauthorized" });
+  }
+
+  const message = req.body && (req.body.message || req.body.edited_message);
+  if (!message || !message.chat || !message.from || typeof message.text !== "string") {
+    return res.json({ ok: true });
+  }
+
+  const chatId = message.chat.id;
+  const userId = message.from.id;
+  try {
+    if (!telegramAllowed(userId)) {
+      await telegramSend(chatId, `Tài khoản chưa được cấp quyền. Telegram ID của bạn: ${userId}. Hãy thêm ID này vào TELEGRAM_ALLOWED_USER_IDS trên Render rồi thử lại.`);
+      return res.json({ ok: true });
+    }
+
+    const text = message.text.trim();
+    if (/^\/(start|help)(@\w+)?$/i.test(text)) {
+      await telegramSend(chatId, "Tra SKU Sapo\nGửi đúng 3 ký tự cuối của mã đơn, ví dụ 789 hoặc A7B. Bot tìm các đơn trong nhóm Chưa xử lý và Đã xử lý.");
+      return res.json({ ok: true });
+    }
+
+    const query = text.replace(/^\/search(?:@\w+)?\s*/i, "").trim();
+    const normalized = normalizeLastCodePart(query);
+    if (normalized.length !== 3) {
+      await telegramSend(chatId, "Hãy gửi đúng 3 ký tự cuối của mã đơn, ví dụ: 789 hoặc A7B.");
+      return res.json({ ok: true });
+    }
+
+    const result = await searchOrders(query);
+    const matches = (result.orders || []).filter(order => normalizeLastCodePart(order.code).endsWith(normalized));
+    if (!matches.length) {
+      await telegramSend(chatId, `Không tìm thấy đơn có mã kết thúc bằng \"${query}\".\nĐã quét ${result.scanned || 0} đơn${result.partial ? "; dữ liệu có thể chưa đầy đủ do giới hạn số trang" : ""}.`);
+      return res.json({ ok: true });
+    }
+
+    const header = `Tìm thấy ${matches.length} đơn khớp \"${query}\"${result.partial ? "\nLưu ý: dữ liệu đã quét có thể chưa đầy đủ." : ""}`;
+    const chunks = [];
+    let current = header;
+    for (const order of matches) {
+      const block = "\n\n" + telegramOrderText(order);
+      if ((current + block).length > 3800) {
+        chunks.push(current);
+        current = telegramOrderText(order);
+      } else current += block;
+    }
+    if (current) chunks.push(current);
+    for (const chunk of chunks) await telegramSend(chatId, chunk);
+    return res.json({ ok: true });
+  } catch (error) {
+    try {
+      await telegramSend(chatId, `Lỗi tra cứu: ${error && error.message ? error.message : "Không thể kết nối Sapo."}`);
+    } catch (_) {}
+    return res.json({ ok: true });
   }
 });
 
