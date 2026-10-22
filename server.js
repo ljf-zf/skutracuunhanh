@@ -233,7 +233,7 @@ async function telegramSend(chatId, text) {
 function telegramOrderText(order) {
   const lines = [
     `Đơn: ${cleanTelegramText(order.code || "Không rõ mã")}`,
-    `Trạng thái: ${cleanTelegramText(order.status || "Chưa xác định")}`,
+  
     `Vận chuyển: ${cleanTelegramText(order.carrier || "Chưa xác định")}`
   ];
   if (order.trackingCode) lines.push(`Vận đơn: ${cleanTelegramText(order.trackingCode)}`);
