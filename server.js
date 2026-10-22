@@ -239,7 +239,7 @@ function telegramOrderText(order) {
   if (order.trackingCode) lines.push(`Vận đơn: ${cleanTelegramText(order.trackingCode)}`);
   for (const item of (order.items || [])) {
     lines.push(`SKU: ${cleanTelegramText(item.sku || "Chưa có SKU")} × ${Number(item.quantity) || 0}`);
-    lines.push(`SP: ${cleanTelegramText(item.name || "Chưa có tên")}${item.variant ? ` · ${cleanTelegramText(item.variant)}` : ""}`);
+
   }
   return lines.join("\n");
 }
